@@ -9,8 +9,11 @@ embedding sub-pixel alignment macros with literature-backed SEM noise physics:
   - Cazaux (1999): Localized Gaussian surface charging swells (dielectric charging)
 """
 
+import os
+import argparse
 import numpy as np
 import cv2
+import pandas as pd
 
 class OfficialSEMWaferGenerator:
     """
@@ -214,9 +217,56 @@ class OfficialSEMWaferGenerator:
 
         return ref_img, search_img, (gt_x, gt_y)
 
-if __name__ == '__main__':
+def generate_dataset_batch(output_dir: str = "./sem_dataset", num_pairs: int = 200):
+    """
+    Generates a massive dataset of high-precision SEM image pairs into output_dir along with ground_truth.csv.
+    """
+    os.makedirs(output_dir, exist_ok=True)
     generator = OfficialSEMWaferGenerator()
-    ref, search, (gt_x, gt_y) = generator.generate_pair(seed_val=42, pattern_style="DRAM", stress_mode="Standard")
-    print(f"Generated SEM Wafer Pair successfully!")
-    print(f"Ref image shape: {ref.shape}, Search image shape: {search.shape}")
-    print(f"Ground Truth macro position: (gt_x={gt_x:.4f}, gt_y={gt_y:.4f})")
+
+    patterns = ["DRAM", "FinFET"]
+    stress_modes = ["Standard", "Heavy Noise", "Surface Charging"]
+
+    records = []
+
+    print(f"Generating massive dataset of {num_pairs} SEM image pairs in '{output_dir}'...")
+    for i in range(num_pairs):
+        pair_id = f"pair_{i+1:03d}"
+        pattern_style = patterns[i % len(patterns)]
+        stress_mode = stress_modes[i % len(stress_modes)]
+        seed_val = 5000 + i
+
+        ref_img, search_img, (gt_x, gt_y) = generator.generate_pair(
+            seed_val=seed_val, pattern_style=pattern_style, stress_mode=stress_mode
+        )
+
+        ref_path = os.path.join(output_dir, f"{pair_id}_ref.png")
+        search_path = os.path.join(output_dir, f"{pair_id}_search.png")
+
+        cv2.imwrite(ref_path, ref_img)
+        cv2.imwrite(search_path, search_img)
+
+        records.append({
+            "image_id": pair_id,
+            "gt_x": round(gt_x, 4),
+            "gt_y": round(gt_y, 4),
+            "pattern_style": pattern_style,
+            "stress_mode": stress_mode
+        })
+
+        if (i + 1) % 25 == 0 or (i + 1) == num_pairs:
+            print(f"  --> Progress: {i+1}/{num_pairs} pairs generated...")
+
+    gt_df = pd.DataFrame(records)
+    gt_csv_path = os.path.join(output_dir, "ground_truth.csv")
+    gt_df.to_csv(gt_csv_path, index=False)
+    print(f"Successfully generated {num_pairs} SEM image pairs in '{output_dir}'!")
+    print(f"Ground truth exported to '{gt_csv_path}'.")
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="SEM Wafer Image Dataset Batch Generator")
+    parser.add_argument("--output_dir", type=str, default="./sem_dataset", help="Output directory for generated dataset")
+    parser.add_argument("--num_pairs", type=int, default=200, help="Number of image pairs to generate")
+    args = parser.parse_args()
+
+    generate_dataset_batch(output_dir=args.output_dir, num_pairs=args.num_pairs)
