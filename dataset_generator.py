@@ -200,13 +200,15 @@ class OfficialSEMWaferGenerator:
             flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT, borderValue=0
         )
         
-        # Mask for blending tile (non-background pixels)
-        tile_mask = (ref_tile_clean > 55.0).astype(np.float32)
+        # Smooth square tile mask with Gaussian feathering for realistic wafer boundary blending
+        sq_mask = np.zeros((100, 100), dtype=np.float32)
+        sq_mask[4:96, 4:96] = 1.0
+        sq_mask = cv2.GaussianBlur(sq_mask, (15, 15), 4.0)
+
         warped_mask = cv2.warpAffine(
-            tile_mask, affine_mat, (self.image_size, self.image_size),
+            sq_mask, affine_mat, (self.image_size, self.image_size),
             flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT, borderValue=0
         )
-        warped_mask = np.clip(warped_mask, 0.0, 1.0)
 
         # Composite tile over periodic background
         search_composite = search_clean_bg * (1.0 - warped_mask) + warped_tile * warped_mask

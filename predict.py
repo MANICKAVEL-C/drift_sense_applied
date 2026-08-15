@@ -5,7 +5,7 @@ Applied Materials Metrology Challenge
 Localizes 10x downsampled reference macro pattern inside 1000x1000 SEM search images:
   - Difference-of-Gaussians (DoG) bandpass filtering to suppress low-frequency charging and high-frequency noise.
   - Normalized Cross-Correlation (NCC) template matching.
-  - Applied Materials Rule 3: Peak candidate selection within 5% of max correlation closest to image center (500, 500).
+  - Applied Materials Rule 3: Peak candidate selection within 3% of max correlation closest to image center (500, 500).
   - 2D Parabolic Quadratic Surface Fitting over 3x3 peak neighborhood for sub-pixel accuracy.
 """
 
@@ -17,20 +17,20 @@ import cv2
 import pandas as pd
 from scipy.ndimage import maximum_filter
 
-def apply_dog_filter(img: np.ndarray, sigma_fine: float = 1.2, sigma_coarse: float = 10.0) -> np.ndarray:
+def apply_dog_filter(img: np.ndarray, sigma_fine: float = 1.0, sigma_coarse: float = 20.0) -> np.ndarray:
     """
     Applies Difference-of-Gaussians (DoG) bandpass filter.
-    Subtracts coarse blur (low-frequency charging) from fine blur (high-frequency noise reduction),
+    Subtracts coarse blur (low-frequency Cazaux charging swells) from fine blur (Sim high-frequency noise reduction),
     normalizing response to zero-mean and unit variance.
     """
     img_float = img.astype(np.float32)
-    blur_fine = cv2.GaussianBlur(img_float, (0, 0), sigmaX=sigma_fine, sigmaY=sigma_fine)
     blur_coarse = cv2.GaussianBlur(img_float, (0, 0), sigmaX=sigma_coarse, sigmaY=sigma_coarse)
-    dog = blur_fine - blur_coarse
-    std_val = np.std(dog)
+    hp = img_float - blur_coarse
+    blur_fine = cv2.GaussianBlur(hp, (0, 0), sigmaX=sigma_fine, sigmaY=sigma_fine)
+    std_val = np.std(blur_fine)
     if std_val > 1e-6:
-        dog = (dog - np.mean(dog)) / std_val
-    return dog
+        blur_fine = blur_fine / std_val
+    return blur_fine
 
 def fit_2d_parabola_subpixel(neighborhood: np.ndarray) -> tuple:
     """
@@ -96,16 +96,15 @@ def get_center_coordinates(ref_img: np.ndarray, search_img: np.ndarray) -> tuple
     tpl_10x = cv2.resize(ref_img, (100, 100), interpolation=cv2.INTER_AREA)
 
     # 2. Apply Difference-of-Gaussians (DoG) bandpass filter
-    tpl_dog = apply_dog_filter(tpl_10x, sigma_fine=1.2, sigma_coarse=10.0)
-    search_dog = apply_dog_filter(search_img, sigma_fine=1.2, sigma_coarse=10.0)
+    tpl_dog = apply_dog_filter(tpl_10x, sigma_fine=1.0, sigma_coarse=20.0)
+    search_dog = apply_dog_filter(search_img, sigma_fine=1.0, sigma_coarse=20.0)
 
     # 3. Normalized Cross-Correlation (NCC)
     corr_map = cv2.matchTemplate(search_dog.astype(np.float32), tpl_dog.astype(np.float32), cv2.TM_CCOEFF_NORMED)
 
-    # 4. Candidate Peak Extraction within 5% of Maximum Correlation
+    # 4. Candidate Peak Extraction
     max_val = float(np.max(corr_map))
-    # Relative threshold within 3% of maximum correlation to select true macro candidates
-    threshold = max_val * 0.97
+    threshold = max_val * 0.98
 
     # Local maxima map via maximum filter
     local_max = (maximum_filter(corr_map, size=5) == corr_map) & (corr_map >= threshold)
