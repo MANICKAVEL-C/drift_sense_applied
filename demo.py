@@ -5,9 +5,9 @@ Applied Materials Metrology Challenge (SEMICON India 2026)
 Runs the complete end-to-end metrology workflow in a single command:
   1. Synthetic Dataset Generation (10 SEM pairs)
   2. Sub-Pixel Prediction Solver (predict.py -> submission.csv)
-  3. Benchmark Validation Suite (test_pipeline.py)
-  4. RGB Optical Microscope Bonus Module (optical_generator.py)
-  5. Visual Inspection Figures Generator (visual_evaluator.py)
+  3. RGB Optical Microscope Bonus Module (optical_generator.py)
+  4. Visual Inspection Figures & System Architecture Diagram Generator
+  5. Official Validation Benchmark Suite (test_pipeline.py)
 """
 
 import time
@@ -32,8 +32,9 @@ def main():
     subprocess.run([sys.executable, "optical_generator.py"])
     time.sleep(1)
 
-    print_banner("4. GENERATING VISUAL INSPECTION FIGURES")
+    print_banner("4. GENERATING VISUAL INSPECTION FIGURES & SYSTEM DIAGRAM")
     subprocess.run([sys.executable, "visual_evaluator.py"])
+    subprocess.run([sys.executable, "generate_architecture_diagram.py"])
     time.sleep(1)
 
     print_banner("5. RUNNING OFFICIAL VALIDATION BENCHMARK SUITE")
