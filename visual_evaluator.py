@@ -3,7 +3,7 @@ visual_evaluator.py - Visual Metrology Inspection & Plotting Suite
 Applied Materials Metrology Challenge
 
 Generates side-by-side visual demonstration figures showing reference images, wide search images with
-ground truth vs predicted bounding boxes/crosshairs, DoG filter response maps, and sub-pixel error vectors.
+ground truth vs predicted bounding boxes/crosshairs, rolling-ball filter response maps, and sub-pixel error vectors.
 """
 
 import os
@@ -11,7 +11,7 @@ import numpy as np
 import cv2
 import matplotlib.pyplot as plt
 from dataset_generator import OfficialSEMWaferGenerator
-from predict import get_center_coordinates, apply_dog_filter
+from predict import get_center_coordinates, apply_rollingball_filter
 
 def create_visual_inspection_report(output_dir: str = "visual_reports"):
     os.makedirs(output_dir, exist_ok=True)
@@ -23,12 +23,12 @@ def create_visual_inspection_report(output_dir: str = "visual_reports"):
             seed_val=42 + idx, pattern_style=style, stress_mode="Standard"
         )
 
-        pred_x, pred_y, confidence = get_center_coordinates(ref_img, search_img)
+        pred_x, pred_y, confidence, psr, is_valid = get_center_coordinates(ref_img, search_img)
         err = np.sqrt((pred_x - gt_x)**2 + (pred_y - gt_y)**2)
 
-        # Process DoG filter maps
+        # Process Rolling-Ball background subtraction filter map
         tpl_10x = cv2.resize(ref_img, (100, 100), interpolation=cv2.INTER_AREA)
-        dog_search = apply_dog_filter(search_img, sigma_fine=1.0, sigma_coarse=20.0)
+        filter_search = apply_rollingball_filter(search_img, sigma_fine=2.0, ball_radius=50, downsample=4)
 
         # Plotting figure
         fig, axes = plt.subplots(1, 3, figsize=(18, 6))
@@ -56,9 +56,9 @@ def create_visual_inspection_report(output_dir: str = "visual_reports"):
         axes[1].set_title(f"Wide Search Image (1000x1000, 10 nm/px)\nGreen: Ground Truth ({gt_x:.1f}, {gt_y:.1f}) | Red: Pred ({pred_x:.1f}, {pred_y:.1f})")
         axes[1].axis('off')
 
-        # 3. DoG Filter Response Map
-        axes[2].imshow(dog_search, cmap='inferno')
-        axes[2].set_title(f"Difference-of-Gaussians (DoG) Filter Map\n[Surface Charging & Noise Suppressed]")
+        # 3. Filter Response Map
+        axes[2].imshow(filter_search, cmap='inferno')
+        axes[2].set_title(f"Rolling-Ball Filter Response Map\n[Surface Charging & Noise Suppressed]")
         axes[2].axis('off')
 
         plt.tight_layout()

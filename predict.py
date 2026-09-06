@@ -4,7 +4,7 @@ Applied Materials Metrology Challenge
 
 Localizes 10x downsampled reference macro pattern inside 1000x1000 SEM search images:
   - Rolling-ball morphological background subtraction + fine Gaussian bandpass filtering.
-  - Multi-scale template pyramid search (0.95x, 1.0x, 1.05x) for scale-jitter robustness.
+  - Multi-scale template pyramid search (0.90x to 1.10x) for scale-jitter robustness (9.0x to 11.0x).
   - Peak-to-Sidelobe Ratio (PSR) & calibrated confidence estimation.
   - Applied Materials Rule 3: Candidate selection within 3% of max correlation closest to center (500, 500).
   - 2D Quadratic Least-Squares Surface Fitting with negative-definiteness Hessian verification.
@@ -44,7 +44,7 @@ def apply_rollingball_filter(img: np.ndarray, sigma_fine: float = 2.0, ball_radi
 def fit_2d_parabola_subpixel(neighborhood: np.ndarray) -> tuple:
     """
     Fits a 2D quadratic surface f(x, y) = a*x^2 + b*y^2 + c*x + d*y + e*x*y + f over a 3x3 grid.
-    Includes Hessian negative-definiteness verification (2a < 0, 2b < 0, det(M) > 0) to ensure
+    Includes Hessian negative-definiteness verification (a < 0, b < 0, det(M) > 0) to ensure
     the critical point is a true local maximum, falling back to central differences if not.
     """
     if neighborhood.shape != (3, 3):
@@ -61,7 +61,7 @@ def fit_2d_parabola_subpixel(neighborhood: np.ndarray) -> tuple:
         a, b, c, d, e, _ = coeffs
 
         det_H = 4 * a * b - e**2
-        # Hessian Negative-Definiteness check for local maximum: 2a < 0, 2b < 0, det(H) > 0
+        # Hessian Negative-Definiteness check for local maximum: a < 0, b < 0, det(H) > 0
         if a < 0 and b < 0 and det_H > 1e-6:
             M = np.array([[2*a, e], [e, 2*b]], dtype=np.float64)
             B = np.array([-c, -d], dtype=np.float64)
@@ -91,7 +91,7 @@ def calculate_psr(corr_map: np.ndarray, peak_x: int, peak_y: int, radius: int = 
     """
     Computes Peak-to-Sidelobe Ratio (PSR) for signal reliability verification:
       PSR = (Peak_Value - Mean_Sidelobe) / Std_Sidelobe
-    High PSR (> 6.0) indicates a strong, unambiguous target match.
+    High PSR (> 4.0) indicates a strong, unambiguous target match.
     """
     h, w = corr_map.shape
     peak_val = corr_map[peak_y, peak_x]
@@ -116,19 +116,19 @@ def calculate_psr(corr_map: np.ndarray, peak_x: int, peak_y: int, radius: int = 
 def get_center_coordinates(ref_img: np.ndarray, search_img: np.ndarray) -> tuple:
     """
     Localizes reference macro pattern in search image with sub-pixel spatial accuracy.
-    Includes multi-scale template matching (0.95x, 1.0x, 1.05x) and PSR-based confidence.
+    Includes multi-scale template matching (0.90x to 1.10x) and PSR-based confidence.
 
     Args:
         ref_img (np.ndarray): 1000x1000 reference image at 1 nm/px scale.
         search_img (np.ndarray): 1000x1000 search image at 10 nm/px scale.
 
     Returns:
-        tuple: (pred_x, pred_y, confidence, psr, is_valid_match)
+        tuple: (pred_x, pred_y, confidence, psr_score, is_valid_match)
     """
     search_dog = apply_rollingball_filter(search_img, sigma_fine=2.0, ball_radius=50, downsample=4)
 
-    # Multi-Scale Pyramid Search over ±5% Scale Jitter
-    scales = [0.95, 0.98, 1.0, 1.02, 1.05]
+    # Multi-Scale Pyramid Search over 9.0x to 11.0x Magnification Jitter Range
+    scales = [0.90, 0.93, 0.95, 0.98, 1.0, 1.02, 1.05, 1.08, 1.10]
     best_scale_val = -1.0
     best_corr_map = None
     best_tpl_w, best_tpl_h = 100, 100
@@ -185,7 +185,7 @@ def get_center_coordinates(ref_img: np.ndarray, search_img: np.ndarray) -> tuple
     pred_x = float(best_px + (best_tpl_w / 2.0) + dx)
     pred_y = float(best_py + (best_tpl_h / 2.0) + dy)
 
-    return pred_x, pred_y, confidence
+    return pred_x, pred_y, confidence, psr_score, is_valid_match
 
 def main():
     parser = argparse.ArgumentParser(description="SEM Wafer Sub-Pixel Metrology Solver")
@@ -204,8 +204,15 @@ def main():
                 ref_img = cv2.imread(ref_file, cv2.IMREAD_GRAYSCALE)
                 search_img = cv2.imread(search_file, cv2.IMREAD_GRAYSCALE)
 
-                pred_x, pred_y, conf = get_center_coordinates(ref_img, search_img)
-                results.append({"image_id": img_id, "pred_x": pred_x, "pred_y": pred_y, "confidence": conf})
+                pred_x, pred_y, conf, psr, is_valid = get_center_coordinates(ref_img, search_img)
+                results.append({
+                    "image_id": img_id,
+                    "pred_x": pred_x,
+                    "pred_y": pred_y,
+                    "confidence": conf,
+                    "psr": psr,
+                    "is_valid_match": is_valid
+                })
 
     if not results:
         print("No input images found in directory. Generating mock demo submission...")
@@ -213,8 +220,15 @@ def main():
         gen = OfficialSEMWaferGenerator()
         for i in range(5):
             ref_img, search_img, (gt_x, gt_y) = gen.generate_pair(seed_val=100 + i, pattern_style="DRAM", stress_mode="Standard")
-            pred_x, pred_y, conf = get_center_coordinates(ref_img, search_img)
-            results.append({"image_id": f"sample_{i+1:03d}", "pred_x": pred_x, "pred_y": pred_y, "confidence": conf})
+            pred_x, pred_y, conf, psr, is_valid = get_center_coordinates(ref_img, search_img)
+            results.append({
+                "image_id": f"sample_{i+1:03d}",
+                "pred_x": pred_x,
+                "pred_y": pred_y,
+                "confidence": conf,
+                "psr": psr,
+                "is_valid_match": is_valid
+            })
 
     df = pd.DataFrame(results)
     df.to_csv(args.output_csv, index=False)
