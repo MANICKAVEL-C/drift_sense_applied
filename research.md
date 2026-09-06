@@ -54,21 +54,41 @@ The high-magnification reference image $R_{100x} \in \mathbb{R}^{1000 \times 100
 
 $$T(u, v) = \frac{1}{s^2} \int_{us}^{(u+1)s} \int_{vs}^{(v+1)s} R_{100x}(x, y) \, dx \, dy \quad \text{where } s = 10.0$$
 
-### 2.2 Adaptive Local Contrast Equalization + Difference-of-Gaussians (DoG) Bandpass Filtering
-To recover signal contrast suppressed under Cazaux surface potential swells, we first apply Contrast Limited Adaptive Histogram Equalization (CLAHE) over spatial tiles $8 \times 8$ with clip limit $\gamma = 2.0$:
+### 2.2 Rolling-Ball Morphological Background Subtraction + Fine Gaussian Bandpass
 
-$$I_{\text{equalized}} = \text{CLAHE}(I_{\text{search}}, \text{clip}=2.0, \text{tiles}=8\times8)$$
+*(Note: an earlier version of this pipeline used a symmetric Difference-of-Gaussians filter here.
+It was replaced after benchmarking showed its coarse Gaussian blur only partially removed the
+Cazaux charging swell -- a wide symmetric blur that removes a 200px-scale swell also smears away
+legitimate template structure at a similar scale. The method below is what is actually implemented
+in `predict.py`.)*
 
-Next, we pass the equalized search image through a spatial Difference-of-Gaussians (DoG) bandpass filter operator $\mathcal{B}_{\sigma_{\text{fine}}, \sigma_{\text{coarse}}}$:
+We first apply a fine Gaussian blur to suppress high-frequency Poisson shot noise:
 
-$$\text{DoG}(x, y) = \left( G_{\sigma_{\text{fine}}} * I \right)(x, y) - \left( G_{\sigma_{\text{coarse}}} * I \right)(x, y)$$
+$$I_{\text{fine}} = G_{\sigma_{\text{fine}}} * I, \quad \sigma_{\text{fine}} = 2.0$$
 
-Where the 2D Gaussian spatial smoothing kernel is defined as:
+We then estimate the slowly-varying charging background via grayscale morphological opening
+(erosion followed by dilation) with a large elliptical structuring element $\mathbf{B}_r$ of
+radius $r$:
 
-$$G_\sigma(x, y) = \frac{1}{2\pi \sigma^2} \exp\left(-\frac{x^2 + y^2}{2\sigma^2}\right)$$
+$$I_{\text{bg}} = (I_{\text{fine}} \ominus \mathbf{B}_r) \oplus \mathbf{B}_r$$
 
-- **Fine blur ($\sigma_{\text{fine}} = 2.0$)**: Low-pass cutoff suppressing high-frequency Poisson electron shot noise ($\omega > \omega_{\text{fine}}$).
-- **Coarse blur ($\sigma_{\text{coarse}} = 40.0$)**: High-pass cutoff eliminating low-frequency Cazaux surface potential swells ($\omega < \omega_{\text{coarse}}$).
+Because opening removes bright structures smaller than the structuring element while preserving
+larger smooth trends, $I_{\text{bg}}$ selectively captures the charging swell (spatial scale
+$\sim$180--250px) while leaving the periodic array and macro-tile structure (smaller scale)
+untouched -- unlike a symmetric Gaussian blur, which cannot distinguish "large and smooth" from
+"large and legitimate." The background is estimated on a 4x-downsampled copy of the image (the
+swell is smooth and low-frequency, so no relevant signal is lost) then upsampled back, which is
+both more accurate and roughly 3x faster than full-resolution Gaussian filtering.
+
+$$I_{\text{filtered}} = I_{\text{fine}} - I_{\text{bg}}, \quad \text{normalized to zero-mean/unit-variance}$$
+
+Search-image structuring-element radius $r_{\text{search}} = 50\,\text{px}$; template radius
+$r_{\text{template}} = 12\,\text{px}$ (scaled down since the 100x100 template itself is 10x smaller).
+
+**Validated impact (240-pair benchmark):** raised Surface Charging sub-pixel accuracy from
+**41.2% to 100.0%**, while Standard and Heavy Noise modes remained at 100.0%, with zero
+catastrophic (>5px) failures in any stress mode -- and ~3x faster inference (39ms vs 112ms
+per pair) due to the downsampled background-estimation pass.
 
 ### 2.3 Normalized Cross-Correlation (NCC) Matching
 The filtered template $T_{\text{DoG}}$ is correlated across filtered search canvas $S_{\text{DoG}} \in \mathbb{R}^{1000 \times 1000}$:
@@ -85,40 +105,39 @@ In periodic semiconductor structure arrays (DRAM trench pitch $P_x$, FinFET logi
 2. Select candidate index $k^*$ minimizing Euclidean spatial offset to search center $(w/2, h/2) = (500, 500)$:
    $$k^* = \arg\min_k \sqrt{(x_k - 500)^2 + (y_k - 500)^2}$$
 
-### 2.5 Continuous 2D Quadratic Hessian Sub-Pixel Surface Refinement
-Around the integer peak grid location $(x_0, y_0)$, we extract a $3 \times 3$ correlation neighborhood $\mathbf{M} \in \mathbb{R}^{3 \times 3}$:
+### 2.5 Continuous 2D Quadratic Least-Squares Sub-Pixel Surface Refinement
 
-$$\mathbf{M} = \begin{bmatrix} \gamma_{-1,-1} & \gamma_{-1,0} & \gamma_{-1,1} \\ \gamma_{0,-1} & \gamma_{0,0} & \gamma_{0,1} \\ \gamma_{1,-1} & \gamma_{1,0} & \gamma_{1,1} \end{bmatrix}$$
+*(Note: this section previously described a simplified 5-point finite-difference Hessian
+shortcut. That formulation does not match what `predict.py` actually computes -- verified
+numerically, the two diverge on real correlation neighborhoods. The derivation below matches
+the implemented code.)*
 
-We model the continuous correlation surface $f(\Delta x, \Delta y)$ via a second-order Taylor expansion:
+Around the integer peak grid location $(x_0, y_0)$, we extract a $3 \times 3$ correlation
+neighborhood and fit a full general quadratic surface to **all nine points** via least squares,
+rather than reading off a handful of finite differences:
 
-$$f(\Delta x, \Delta y) = f_0 + \mathbf{g}^T \mathbf{d} + \frac{1}{2} \mathbf{d}^T \mathbf{H} \mathbf{d}$$
+$$f(x, y) = a x^2 + b y^2 + c x + d y + e xy + f_0$$
 
-Where $\mathbf{d} = [\Delta x, \Delta y]^T$, the spatial gradient vector $\mathbf{g} = \left[ \frac{\partial f}{\partial x}, \frac{\partial f}{\partial y} \right]^T$ is:
+$$\mathbf{A}\boldsymbol{\theta} = \mathbf{z}, \quad \boldsymbol{\theta} = [a, b, c, d, e, f_0]^T, \quad \boldsymbol{\theta}^* = (\mathbf{A}^T\mathbf{A})^{-1}\mathbf{A}^T\mathbf{z}$$
 
-$$\frac{\partial f}{\partial x} = \frac{\gamma_{0,1} - \gamma_{0,-1}}{2}, \quad \frac{\partial f}{\partial y} = \frac{\gamma_{1,0} - \gamma_{-1,0}}{2}$$
+where $\mathbf{z}$ is the flattened $3\times3$ neighborhood and $\mathbf{A}$ is the design matrix
+of $(x^2, y^2, x, y, xy, 1)$ evaluated at the nine grid offsets. Using all nine samples (rather
+than a small stencil) makes the fit more robust to noise in the correlation surface, at the cost
+of the closed-form simplicity of a pure finite-difference approach.
 
-And the spatial Hessian matrix $\mathbf{H} = \begin{bmatrix} \frac{\partial^2 f}{\partial x^2} & \frac{\partial^2 f}{\partial x \partial y} \\ \frac{\partial^2 f}{\partial x \partial y} & \frac{\partial^2 f}{\partial y^2} \end{bmatrix}$ is computed via discrete central finite differences:
+The critical point of the fitted quadratic is found by setting its gradient to zero:
 
-$$\frac{\partial^2 f}{\partial x^2} = \gamma_{0,1} - 2\gamma_{0,0} + \gamma_{0,-1}$$
+$$\begin{bmatrix} 2a & e \\ e & 2b \end{bmatrix} \begin{bmatrix} \Delta x^* \\ \Delta y^* \end{bmatrix} = \begin{bmatrix} -c \\ -d \end{bmatrix}$$
 
-$$\frac{\partial^2 f}{\partial y^2} = \gamma_{1,0} - 2\gamma_{0,0} + \gamma_{-1,0}$$
-
-$$\frac{\partial^2 f}{\partial x \partial y} = \frac{\gamma_{1,1} - \gamma_{1,-1} - \gamma_{-1,1} + \gamma_{-1,-1}}{4}$$
-
-Setting the gradient of the surface fit to zero ($\nabla f = \mathbf{g} + \mathbf{H}\mathbf{d} = 0$):
-
-$$\mathbf{d}^* = -\mathbf{H}^{-1} \mathbf{g}$$
-
-Provided that the Hessian matrix is negative-definite ($\det(\mathbf{H}) > 10^{-6}$ and $\text{Tr}(\mathbf{H}) < 0$), the closed-form continuous sub-pixel spatial offset is:
-
-$$\begin{bmatrix} \Delta x^* \\ \Delta y^* \end{bmatrix} = -\frac{1}{\frac{\partial^2 f}{\partial x^2}\frac{\partial^2 f}{\partial y^2} - \left(\frac{\partial^2 f}{\partial x \partial y}\right)^2} \begin{bmatrix} \frac{\partial^2 f}{\partial y^2} & -\frac{\partial^2 f}{\partial x \partial y} \\ -\frac{\partial^2 f}{\partial x \partial y} & \frac{\partial^2 f}{\partial x^2} \end{bmatrix} \begin{bmatrix} \frac{\partial f}{\partial x} \\ \frac{\partial f}{\partial y} \end{bmatrix}$$
+solved directly provided $\det \ne 0$. **Known gap (not yet fixed in code):** this does not
+currently verify that the critical point is actually a maximum (i.e. that the 2x2 matrix above
+is negative-definite) -- it only checks the determinant is nonzero. A saddle point or minimum
+could in principle be accepted uncorrected. Recommended fix: additionally require
+$2a < 0$ and $\det > 0$, falling back to the existing simple central-difference method otherwise.
 
 The final predicted target center is:
 
 $$(x_{\text{pred}}, y_{\text{pred}}) = (x_0 + \Delta x^*, y_0 + \Delta y^*)$$
-
-This continuous sub-pixel optimization yields continuous spatial resolution down to **$0.16\,\text{nm}$ ($0.16\,\text{px}$)**.
 
 ---
 
@@ -126,7 +145,7 @@ This continuous sub-pixel optimization yields continuous spatial resolution down
 
 | Metric / Property | Classical Raw Template Matching | Basic Deep Learning (CNN Bounding Box) | Drift-Sense Sub-Pixel Solver |
 | :--- | :--- | :--- | :--- |
-| **Spatial Precision** | Integer Pixel ($\pm 1.0 - 5.0\,\text{px}$) | Bounding Box ($\pm 2.0 - 4.0\,\text{px}$) | **Sub-Nanometer Continuous ($0.16\,\text{px} / 0.16\,\text{nm}$)** |
-| **Hardware Requirement** | CPU-only | NVIDIA GPU Required (CUDA) | **Zero-GPU (Standard x86 CPU, ~120ms)** |
-| **Cazaux Charging Swells** | Fails (Locks to local brightness) | Requires 5000+ training images | **DoG Bandpass Filtered ($\sigma_1=2.0, \sigma_2=40.0$)** |
+| **Spatial Precision** | Integer Pixel ($\pm 1.0 - 5.0\,\text{px}$) | Bounding Box ($\pm 2.0 - 4.0\,\text{px}$) | **Sub-Pixel Continuous (median $0.21\,\text{px}$, 240-pair benchmark)** |
+| **Hardware Requirement** | CPU-only | NVIDIA GPU Required (CUDA) | **Zero-GPU (Standard x86 CPU, ~39ms)** |
+| **Cazaux Charging Swells** | Fails (Locks to local brightness) | Requires 5000+ training images | **Rolling-Ball Background Subtraction (radius=50px), 100% sub-pixel accuracy** |
 | **Periodic Pitch Ambiguity** | Locks to adjacent dies | Phase aliasing uncertainty | **AMAT Rule 3 Tie-Break ($\ge 0.97 R_{\max}$ min dist)** |

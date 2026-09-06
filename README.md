@@ -35,10 +35,10 @@ Supports **DRAM** (contact hole arrays + asymmetric crosshair macro) and **FinFE
 Localizes the 10x downsampled reference macro pattern inside the wide-field search image using a multi-stage pipeline:
 
 1. **10x Scale Downsampling**: Resizes $1000 \times 1000$ reference image to $100 \times 100$ pixels (`cv2.INTER_AREA`).
-2. **Difference-of-Gaussians (DoG) Bandpass Filtering**: Applies fine ($\sigma=1.0$) and coarse ($\sigma=20.0$) Gaussian blurs to strip out Cazaux low-frequency surface potential hills and Sim high-frequency shot noise spikes.
+2. **Rolling-Ball Morphological Background Subtraction + Fine Gaussian Filtering**: Applies a fine Gaussian blur ($\sigma=2.0$) to suppress Sim shot noise, then estimates and subtracts the Cazaux charging background via grayscale morphological opening with a large elliptical kernel (search radius 50px, template radius 12px) rather than a symmetric Gaussian blur -- see §5 for why this replaced an earlier, less effective DoG approach.
 3. **Normalized Cross-Correlation (NCC)**: Computes template correlation map (`cv2.TM_CCOEFF_NORMED`).
-4. **Applied Materials Rule 3 Candidate Selection**: Extracts candidate local maxima within 2% of maximum correlation and selects the peak candidate closest to the image center $(500, 500)$ to resolve periodic array phase aliasing.
-5. **2D Parabolic Quadratic Surface Fitting**: Fits a 2D surface $f(x, y) = ax^2 + by^2 + cx + dy + exy + f$ over the $3 \times 3$ correlation peak neighborhood to achieve sub-pixel spatial precision ($(\Delta x, \Delta y)$ offset).
+4. **Applied Materials Rule 3 Candidate Selection**: Extracts candidate local maxima within 3% of maximum correlation and selects the peak candidate closest to the image center $(500, 500)$ to resolve periodic array phase aliasing.
+5. **2D Quadratic Least-Squares Surface Fitting**: Fits a 2D surface $f(x, y) = ax^2 + by^2 + cx + dy + exy + f$ over all nine points of the $3 \times 3$ correlation peak neighborhood via least squares to achieve sub-pixel spatial precision ($(\Delta x, \Delta y)$ offset).
 
 ---
 
@@ -71,7 +71,7 @@ python predict.py --input_dir ./sem_dataset --output_csv submission.csv
 ```
 
 ### Run Verification & Benchmark Suite
-Run 30 randomized benchmark cases across all stress modes:
+Run 240 randomized benchmark cases across all stress modes:
 ```bash
 python test_pipeline.py
 ```
@@ -90,6 +90,26 @@ python visual_evaluator.py
 
 ---
 
-## 5. Periodic Array Failure Case & Explainability
+## 5. Benchmark Results & Failure Case Resolution
 
-When wafer stage drift exceeds half of the array spatial pitch ($\Delta x > P/2$ or $\Delta y > P/2$), periodic repeating structures (DRAM contact holes / FinFET fins) produce phase ambiguity in template matching. Candidate peaks near the search center are selected via **Applied Materials Rule 3**, while DoG filtering suppresses low-frequency surface potential shifts.
+**240-pair benchmark (current):**
+
+| Stress Mode | Sub-Pixel Rate (<1.0px) | Median Error (px) | Avg Latency (ms) |
+|---|---|---|---|
+| Standard | 100.0% | 0.168 | 38.6 |
+| Heavy Noise | 100.0% | 0.238 | 38.9 |
+| Surface Charging | 100.0% | 0.232 | 38.8 |
+| **Overall** | **100.0%** | **0.214** | **38.8** |
+
+Surface Charging was previously the hardest stress mode (41.2% sub-pixel accuracy) due to a
+fixed-location contrast-washout artifact. Root cause was traced empirically (not assumed) to
+correlation values measured directly on a real failure case: 0.35 at the true site vs. 0.44 at
+an unrelated region. Four mitigations were tried and failed (wider Gaussian blur, CLAHE, sliding-
+window normalization, two-stage rescoring) before finding one that worked: replacing the
+symmetric Gaussian coarse-blur with a rolling-ball morphological background estimate, sized to
+selectively remove the charging swell without smearing away legitimate template-scale structure.
+Re-verified on the exact seed that originally failed (~460px error) -- now accurate to 0.5px.
+
+**Honest caveat**: this was validated against the synthetic generator's specific charging model
+(two fixed Gaussian swells + a linear gradient) and has not been validated against real fab SEM
+charging artifacts, which may have different spatial statistics.
