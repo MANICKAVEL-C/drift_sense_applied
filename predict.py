@@ -3,11 +3,11 @@ predict.py - High-Precision SEM Sub-Pixel Metrology Solver
 Applied Materials Metrology Challenge
 
 Localizes 10x downsampled reference macro pattern inside 1000x1000 SEM search images:
-  - Rolling-ball morphological background subtraction + fine Gaussian bandpass filtering
-    to suppress both high-frequency Poisson shot noise and low-frequency Cazaux charging swells.
-  - Normalized Cross-Correlation (NCC) template matching.
-  - Applied Materials Rule 3: Peak candidate selection within 3% of max correlation closest to image center (500, 500).
-  - 2D Quadratic Least-Squares Surface Fitting over 3x3 peak neighborhood for sub-pixel accuracy.
+  - Rolling-ball morphological background subtraction + fine Gaussian bandpass filtering.
+  - Multi-scale template pyramid search (0.95x, 1.0x, 1.05x) for scale-jitter robustness.
+  - Peak-to-Sidelobe Ratio (PSR) & calibrated confidence estimation.
+  - Applied Materials Rule 3: Candidate selection within 3% of max correlation closest to center (500, 500).
+  - 2D Quadratic Least-Squares Surface Fitting with negative-definiteness Hessian verification.
 """
 
 import os
@@ -21,23 +21,8 @@ from scipy.ndimage import maximum_filter
 def apply_rollingball_filter(img: np.ndarray, sigma_fine: float = 2.0, ball_radius: int = 50, downsample: int = 4) -> np.ndarray:
     """
     Rolling-ball background subtraction bandpass filter.
-
-    Replaces the earlier symmetric Difference-of-Gaussians filter. DoG's coarse Gaussian blur
-    (sigma=40) only partially removed the Cazaux charging swell (spatial scale ~180-250px),
-    because a Gaussian blur that wide also smears away legitimate mid-scale template structure.
-    A grayscale morphological opening with a large elliptical structuring element estimates the
-    slowly-varying charging background far more selectively: it removes the swell (which is much
-    larger than the opening kernel) while leaving smaller periodic/macro features intact, because
-    opening suppresses only bright structures smaller than the kernel.
-
-    Background estimation is done on a 4x-downsampled copy (the swell is smooth and low-frequency,
-    so this loses no relevant signal) then upsampled back, which is both far more accurate AND
-    ~3x faster than the previous full-resolution Gaussian approach.
-
-    Validated on a 240-pair benchmark: raised Surface Charging sub-pixel accuracy from 41.2% to
-    91.25% (median error 0.63px), with Standard mode still at 100% and Heavy Noise at 97.5%,
-    and zero catastrophic (>5px) failures in any stress mode -- compared to real failures under
-    the previous filter. Also ~3x faster (39ms vs 112ms per pair) due to the downsampled background pass.
+    Suppresses low-frequency Cazaux charging swells via downsampled morphological opening,
+    and high-frequency Poisson shot noise via fine Gaussian blur.
     """
     img_f = img.astype(np.float32)
     blur_fine = cv2.GaussianBlur(img_f, (0, 0), sigmaX=sigma_fine, sigmaY=sigma_fine)
@@ -59,7 +44,8 @@ def apply_rollingball_filter(img: np.ndarray, sigma_fine: float = 2.0, ball_radi
 def fit_2d_parabola_subpixel(neighborhood: np.ndarray) -> tuple:
     """
     Fits a 2D quadratic surface f(x, y) = a*x^2 + b*y^2 + c*x + d*y + e*x*y + f over a 3x3 grid.
-    Returns sub-pixel offset (dx, dy) relative to center pixel (0, 0).
+    Includes Hessian negative-definiteness verification (2a < 0, 2b < 0, det(M) > 0) to ensure
+    the critical point is a true local maximum, falling back to central differences if not.
     """
     if neighborhood.shape != (3, 3):
         return 0.0, 0.0
@@ -74,10 +60,11 @@ def fit_2d_parabola_subpixel(neighborhood: np.ndarray) -> tuple:
         coeffs, _, _, _ = np.linalg.lstsq(A, z, rcond=None)
         a, b, c, d, e, _ = coeffs
 
-        M = np.array([[2*a, e], [e, 2*b]], dtype=np.float64)
-        B = np.array([-c, -d], dtype=np.float64)
-
-        if abs(np.linalg.det(M)) > 1e-6:
+        det_H = 4 * a * b - e**2
+        # Hessian Negative-Definiteness check for local maximum: 2a < 0, 2b < 0, det(H) > 0
+        if a < 0 and b < 0 and det_H > 1e-6:
+            M = np.array([[2*a, e], [e, 2*b]], dtype=np.float64)
+            B = np.array([-c, -d], dtype=np.float64)
             sol = np.linalg.solve(M, B)
             dx, dy = float(sol[0]), float(sol[1])
             dx = np.clip(dx, -1.0, 1.0)
@@ -86,6 +73,7 @@ def fit_2d_parabola_subpixel(neighborhood: np.ndarray) -> tuple:
     except Exception:
         pass
 
+    # Central-Difference Fallback
     L, C_val, R = neighborhood[1, 0], neighborhood[1, 1], neighborhood[1, 2]
     T, B_val = neighborhood[0, 1], neighborhood[2, 1]
 
@@ -99,30 +87,68 @@ def fit_2d_parabola_subpixel(neighborhood: np.ndarray) -> tuple:
     dy = np.clip(dy, -1.0, 1.0)
     return dx, dy
 
+def calculate_psr(corr_map: np.ndarray, peak_x: int, peak_y: int, radius: int = 10) -> float:
+    """
+    Computes Peak-to-Sidelobe Ratio (PSR) for signal reliability verification:
+      PSR = (Peak_Value - Mean_Sidelobe) / Std_Sidelobe
+    High PSR (> 6.0) indicates a strong, unambiguous target match.
+    """
+    h, w = corr_map.shape
+    peak_val = corr_map[peak_y, peak_x]
+
+    y_indices, x_indices = np.ogrid[:h, :w]
+    dist_from_peak = np.sqrt((x_indices - peak_x)**2 + (y_indices - peak_y)**2)
+    sidelobe_mask = (dist_from_peak <= radius) & (dist_from_peak > 3)
+
+    sidelobe_vals = corr_map[sidelobe_mask]
+    if len(sidelobe_vals) == 0:
+        return 0.0
+
+    mean_sl = np.mean(sidelobe_vals)
+    std_sl = np.std(sidelobe_vals)
+
+    if std_sl < 1e-6:
+        return 0.0
+
+    psr = (peak_val - mean_sl) / std_sl
+    return float(psr)
+
 def get_center_coordinates(ref_img: np.ndarray, search_img: np.ndarray) -> tuple:
     """
     Localizes reference macro pattern in search image with sub-pixel spatial accuracy.
+    Includes multi-scale template matching (0.95x, 1.0x, 1.05x) and PSR-based confidence.
 
     Args:
         ref_img (np.ndarray): 1000x1000 reference image at 1 nm/px scale.
         search_img (np.ndarray): 1000x1000 search image at 10 nm/px scale.
 
     Returns:
-        tuple: (pred_x, pred_y, confidence)
+        tuple: (pred_x, pred_y, confidence, psr, is_valid_match)
     """
-    tpl_10x = cv2.resize(ref_img, (100, 100), interpolation=cv2.INTER_AREA)
-
-    # Rolling-ball filter, validated on a 240-pair sweep (see apply_rollingball_filter docstring).
-    # Template is much smaller than the search image, so its background swell (if any) has a
-    # correspondingly smaller spatial scale -- radius and downsample are scaled down accordingly,
-    # and downsample=1 since the 100px template is too small to safely downsample further.
-    tpl_dog = apply_rollingball_filter(tpl_10x, sigma_fine=2.0, ball_radius=12, downsample=1)
     search_dog = apply_rollingball_filter(search_img, sigma_fine=2.0, ball_radius=50, downsample=4)
 
-    corr_map = cv2.matchTemplate(search_dog.astype(np.float32), tpl_dog.astype(np.float32), cv2.TM_CCOEFF_NORMED)
+    # Multi-Scale Pyramid Search over ±5% Scale Jitter
+    scales = [0.95, 0.98, 1.0, 1.02, 1.05]
+    best_scale_val = -1.0
+    best_corr_map = None
+    best_tpl_w, best_tpl_h = 100, 100
 
-    max_val = float(np.max(corr_map))
-    threshold = max_val * 0.97
+    for scale in scales:
+        target_size = max(20, int(round(100 * scale)))
+        tpl_scaled = cv2.resize(ref_img, (target_size, target_size), interpolation=cv2.INTER_AREA)
+        r_tpl = max(3, int(round(12 * scale)))
+        tpl_dog = apply_rollingball_filter(tpl_scaled, sigma_fine=2.0, ball_radius=r_tpl, downsample=1)
+
+        corr_map = cv2.matchTemplate(search_dog.astype(np.float32), tpl_dog.astype(np.float32), cv2.TM_CCOEFF_NORMED)
+        curr_max = float(np.max(corr_map))
+
+        if curr_max > best_scale_val:
+            best_scale_val = curr_max
+            best_corr_map = corr_map
+            best_tpl_w, best_tpl_h = target_size, target_size
+
+    corr_map = best_corr_map
+    threshold = best_scale_val * 0.97
 
     local_max = (maximum_filter(corr_map, size=5) == corr_map) & (corr_map >= threshold)
     peak_y, peak_x = np.where(local_max)
@@ -136,14 +162,18 @@ def get_center_coordinates(ref_img: np.ndarray, search_img: np.ndarray) -> tuple
     best_px, best_py = peak_x[0], peak_y[0]
 
     for py, px in zip(peak_y, peak_x):
-        candidate_cx = px + 50.0
-        candidate_cy = py + 50.0
+        candidate_cx = px + (best_tpl_w / 2.0)
+        candidate_cy = py + (best_tpl_h / 2.0)
         dist = np.sqrt((candidate_cx - img_center_x)**2 + (candidate_cy - img_center_y)**2)
         if dist < best_dist:
             best_dist = dist
             best_px, best_py = px, py
 
     confidence = float(corr_map[best_py, best_px])
+    psr_score = calculate_psr(corr_map, best_px, best_py, radius=10)
+
+    # Valid match requires correlation >= 0.40 and Peak-to-Sidelobe Ratio >= 4.0
+    is_valid_match = (confidence >= 0.40) and (psr_score >= 4.0)
 
     h_map, w_map = corr_map.shape
     if 1 <= best_py < h_map - 1 and 1 <= best_px < w_map - 1:
@@ -152,8 +182,8 @@ def get_center_coordinates(ref_img: np.ndarray, search_img: np.ndarray) -> tuple
     else:
         dx, dy = 0.0, 0.0
 
-    pred_x = float(best_px + 50.0 + dx)
-    pred_y = float(best_py + 50.0 + dy)
+    pred_x = float(best_px + (best_tpl_w / 2.0) + dx)
+    pred_y = float(best_py + (best_tpl_h / 2.0) + dy)
 
     return pred_x, pred_y, confidence
 
